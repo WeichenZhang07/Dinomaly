@@ -13,3 +13,4 @@ venv
 env_conda
 .env
 /backbones/backbones/weights/*.pth
+/backbones
