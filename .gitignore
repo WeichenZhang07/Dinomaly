@@ -2,9 +2,9 @@
 *.png
 .vscode
 .idea
-saved_results
-tmp_imgs
-tmp_out
+/saved_results
+/tmp_imgs
+/tmp_out
 __pycache__
 .DS_Store
 env
@@ -12,4 +12,4 @@ env_venv
 venv
 env_conda
 .env
-backbonesbackbones/weights/*.pth
+/backbones/backbones/weights/*.pth
