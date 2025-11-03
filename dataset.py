@@ -578,3 +578,298 @@ class MVTecSimplexDataset(torch.utils.data.Dataset):
         img_noise = self.transform(img_noise)
 
         return img_normal, img_noise
+import os
+from enum import Enum
+import warnings
+
+import PIL
+from PIL import Image
+import torch
+from torchvision import transforms
+
+
+class AspectRatioResize:
+    """
+    保持宽高比：将短边缩放到 target_size。
+    可能导致长边 > target_size，后续通常用 CenterCrop 截取。
+    """
+    def __init__(self, size, interpolation=PIL.Image.BILINEAR):
+        self.size = size
+        self.interp = interpolation
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        w, h = img.size
+        if w < h:
+            new_w = self.size
+            new_h = int(round(h * self.size / w))
+        else:
+            new_h = self.size
+            new_w = int(round(w * self.size / h))
+        return img.resize((new_w, new_h), self.interp)
+
+
+class LongestSideResize:
+    """
+    将长边缩放到 target_size，保持宽高比。适合随后 Pad 到方形不裁剪内容。
+    """
+    def __init__(self, size, interpolation=PIL.Image.BILINEAR):
+        self.size = size
+        self.interp = interpolation
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        w, h = img.size
+        longest = max(w, h)
+        if longest == self.size:
+            return img
+        scale = self.size / longest
+        new_w = int(round(w * scale))
+        new_h = int(round(h * scale))
+        return img.resize((new_w, new_h), self.interp)
+
+
+class PadToSquare:
+    """Pad 图像到 (target_size, target_size)。支持 constant | reflect | replicate。"""
+    def __init__(self, size, mode='reflect', value=0.0):
+        self.size = size
+        self.mode = mode
+        self.value = value
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        w, h = img.size
+        if w == self.size and h == self.size:
+            return img
+        # 若超过目标尺寸（理论上不会，如果前面缩放长边=target）则裁剪中心
+        if w > self.size or h > self.size:
+            left = max(0, (w - self.size) // 2)
+            top = max(0, (h - self.size) // 2)
+            img = img.crop((left, top, left + min(self.size, w), top + min(self.size, h)))
+            w, h = img.size
+        pad_l = (self.size - w) // 2
+        pad_r = self.size - w - pad_l
+        pad_t = (self.size - h) // 2
+        pad_b = self.size - h - pad_t
+        if self.mode == 'constant':
+            color = tuple(int(self.value * 255) for _ in range(3))
+            canvas = Image.new('RGB', (self.size, self.size), color)
+            canvas.paste(img, (pad_l, pad_t))
+            return canvas
+        # 对 reflect / replicate 使用 tensor pad 再转回 PIL
+        import torchvision.transforms.functional as TF
+        tensor = TF.to_tensor(img).unsqueeze(0)  # (1,C,H,W)
+        pad = [pad_l, pad_t, pad_r, pad_b]  # left, top, right, bottom
+        mode = 'reflect' if self.mode == 'reflect' else 'replicate'
+        padded = torch.nn.functional.pad(tensor, (pad[0], pad[2], pad[1], pad[3]), mode=mode)
+        padded = padded.clamp(0, 1)
+        return TF.to_pil_image(padded.squeeze(0))
+
+
+# MVTec AD 2.0 官方类别
+MVTEC_AD2_CLASSNAMES_LIST = {
+    'can': 0,
+    'fabric': 1,
+    'fruit_jelly': 2,
+    'rice': 3,
+    'sheet_metal': 4,
+    'vial': 5,
+    'wallplugs': 6,
+    'walnuts': 7,
+}
+MVTEC_AD2_CLASSNAMES = list(MVTEC_AD2_CLASSNAMES_LIST.keys())
+# 返回一个封装成Tensor的类别ID[B,1]
+def classname_to_idTensor(classname):
+    class_id =  MVTEC_AD2_CLASSNAMES_LIST.get(classname, -1)
+    #class_id转换成Tensor
+    return torch.tensor([[class_id]], dtype=torch.long)
+IMAGENET_MEAN = [0.5, 0.5, 0.5]
+IMAGENET_STD  = [0.5, 0.5, 0.5]
+
+class DatasetSplit(Enum):
+    TRAIN = "train"
+    VAL = "val"
+    TEST = "test"
+
+class MVTecAD2Dataset(torch.utils.data.Dataset):
+    """
+    PyTorch Dataset for MVTec AD 2.0 (mvtec_ad_2).
+    """
+    def __init__(
+        self,
+        source,
+        classname,
+        resize=256,
+        imagesize=224,
+        split=DatasetSplit.TRAIN,
+        train_val_split=1.0,
+    preserve_aspect_ratio=False,
+    pad_to_square=False,
+    pad_mode='reflect',
+    pad_value=0.0,
+    resize_strategy='short_side',  # short_side | longest | none
+    center_crop=True,
+        rotate_degrees=0,
+        translate=0,
+        brightness_factor=0,
+        contrast_factor=0,
+        saturation_factor=0,
+        gray_p=0,
+        h_flip_p=0,
+        v_flip_p=0,
+        scale=0,
+        **kwargs,
+    ):
+        super().__init__()
+        self.source = source
+        self.split = split
+        self.classnames_to_use = [classname] if classname is not None else MVTEC_AD2_CLASSNAMES
+        self.train_val_split = train_val_split
+        self.preserve_aspect_ratio = preserve_aspect_ratio
+        self.transform_std = IMAGENET_STD
+        self.transform_mean = IMAGENET_MEAN
+        self.imgpaths_per_class, self.data_to_iterate = self.get_image_data()
+
+        # 根据参数构建图像/掩码的 resize + pad 流程
+        img_tfms = []
+        mask_tfms = []
+
+        if resize_strategy == 'longest':
+            # 按长边缩放到 imagesize，然后可选 Pad 到正方形
+            img_tfms.append(LongestSideResize(imagesize))
+            mask_tfms.append(LongestSideResize(imagesize, interpolation=PIL.Image.NEAREST))
+            if pad_to_square:
+                img_tfms.append(PadToSquare(imagesize, mode=pad_mode, value=pad_value))
+                # 掩码恒定用0填充，避免引入非零无标注区域
+                mask_tfms.append(PadToSquare(imagesize, mode=pad_mode, value=0.0 if pad_mode == 'constant' else pad_value))
+        elif resize_strategy == 'short_side':
+            if preserve_aspect_ratio:
+                # 保持短边到 imagesize，可选中心裁剪为正方形
+                img_tfms.append(AspectRatioResize(imagesize))
+                mask_tfms.append(AspectRatioResize(imagesize, interpolation=PIL.Image.NEAREST))
+                if center_crop:
+                    img_tfms.append(transforms.CenterCrop(imagesize))
+                    mask_tfms.append(transforms.CenterCrop(imagesize))
+            else:
+                # 直接拉伸至目标分辨率
+                img_tfms.append(transforms.Resize((imagesize, imagesize)))
+                mask_tfms.append(transforms.Resize((imagesize, imagesize), interpolation=transforms.InterpolationMode.NEAREST))
+        elif resize_strategy == 'none':
+            # 不做尺寸变换，仅在需要时 Pad
+            if pad_to_square:
+                img_tfms.append(PadToSquare(imagesize, mode=pad_mode, value=pad_value))
+                mask_tfms.append(PadToSquare(imagesize, mode=pad_mode, value=0.0 if pad_mode == 'constant' else pad_value))
+
+        # 转张量与归一化
+        img_tfms.extend([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ])
+        mask_tfms.extend([
+            transforms.ToTensor(),
+        ])
+
+        self.transform_img = transforms.Compose(img_tfms)
+        self.transform_mask = transforms.Compose(mask_tfms)
+
+        self.imagesize = (3, imagesize, imagesize)
+
+    
+    
+    def __getitem__(self, idx):
+        classname, anomaly, image_path, mask_path = self.data_to_iterate[idx]
+        image = PIL.Image.open(image_path).convert("RGB")
+        image = self.transform_img(image)
+
+        if self.split == DatasetSplit.TEST and mask_path is not None:
+            mask = PIL.Image.open(mask_path)
+            mask = self.transform_mask(mask)
+        else:
+            mask = torch.zeros([1, *image.size()[1:]])
+        classid = classname_to_idTensor(classname)
+
+        return {
+            "image": image,
+            "mask": mask,
+            "classname": classname,
+            "classid": classid,
+            "anomaly": anomaly,
+            "is_anomaly": int(anomaly != "good"),
+            "image_name": "/".join(image_path.replace("\\", "/").split("/")[-4:]),
+            "image_path": image_path,
+        }
+
+    def __len__(self):
+        return len(self.data_to_iterate)
+
+
+    def get_image_data(self):
+        imgpaths_per_class = {}
+        maskpaths_per_class = {}
+        # 原枚举中仅有 train/val/test，这里做目录别名映射，支持实际数据中的 validation / test_public 等
+        split_name = self.split.value  # 'train' | 'val' | 'test'
+        possible_split_dirs = []
+        if split_name == 'train':
+            possible_split_dirs = ['train']
+        elif split_name == 'val':
+            # 优先使用 'validation' 若存在，否则退回 'val'
+            possible_split_dirs = ['validation', 'val']
+        elif split_name == 'test':
+            # 测试优先匹配公开测试集，再退回精简名
+            possible_split_dirs = ['test_public', 'test', 'test_private', 'test_private_mixed']
+        else:
+            possible_split_dirs = [split_name]
+
+        for classname in self.classnames_to_use:
+            if not isinstance(classname, str):
+                # Skip invalid classname entries (e.g., dict accidentally passed)
+                continue
+            # 选择第一个存在的 split 目录
+            chosen_dir = None
+            for cand in possible_split_dirs:
+                cand_dir = os.path.join(self.source, classname, cand)
+                if os.path.isdir(cand_dir):
+                    chosen_dir = cand_dir
+                    break
+            if chosen_dir is None:
+                # 若所有候选都不存在，保留第一候选做报错参考
+                chosen_dir = os.path.join(self.source, classname, possible_split_dirs[0])
+            class_dir = chosen_dir
+            imgpaths_per_class[classname] = {}
+            maskpaths_per_class[classname] = {}
+
+            # 所有split都支持good/bad子目录
+            for anomaly in ["good", "bad"]:
+                anomaly_path = os.path.join(class_dir, anomaly)
+                if os.path.isdir(anomaly_path):
+                    anomaly_files = sorted(os.listdir(anomaly_path))
+                    imgpaths_per_class[classname][anomaly] = [
+                        os.path.join(anomaly_path, x) for x in anomaly_files if os.path.isfile(os.path.join(anomaly_path, x))
+                    ]
+                    # mask仅test_public/bad有
+                    if split_name == "test_public" and anomaly == "bad":
+                        mask_dir = os.path.join(self.source, classname, "ground_truth", "bad")
+                        mask_files = sorted(os.listdir(mask_dir)) if os.path.isdir(mask_dir) else []
+                        maskpaths_per_class[classname][anomaly] = [
+                            os.path.join(mask_dir, x) for x in mask_files
+                        ]
+                    else:
+                        maskpaths_per_class[classname][anomaly] = [None] * len(imgpaths_per_class[classname][anomaly])
+            # 如果没有good/bad子目录，直接检索class_dir下图片
+            if not imgpaths_per_class[classname]:
+                if os.path.isdir(class_dir):
+                    anomaly_files = sorted(os.listdir(class_dir))
+                    imgpaths_per_class[classname]["good"] = [
+                        os.path.join(class_dir, x) for x in anomaly_files if os.path.isfile(os.path.join(class_dir, x))
+                    ]
+                    maskpaths_per_class[classname]["good"] = [None] * len(imgpaths_per_class[classname]["good"])
+
+        # Unrolls the data dictionary to an easy-to-iterate list.
+        data_to_iterate = []
+        for classname in sorted(imgpaths_per_class.keys()):
+            for anomaly in sorted(imgpaths_per_class[classname].keys()):
+                for i, image_path in enumerate(imgpaths_per_class[classname][anomaly]):
+                    data_tuple = [classname, anomaly, image_path]
+                    mask_list = maskpaths_per_class[classname][anomaly]
+                    mask_path = mask_list[i] if mask_list and i < len(mask_list) else None
+                    data_tuple.append(mask_path)
+                    data_to_iterate.append(data_tuple)
+
+        return imgpaths_per_class, data_to_iterate

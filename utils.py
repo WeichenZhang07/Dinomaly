@@ -394,7 +394,14 @@ def evaluation_batch(model, dataloader, device, _class_=None, max_ratio=0, resiz
         gt_list_sp = torch.cat(gt_list_sp).flatten().cpu().numpy()
         pr_list_sp = torch.cat(pr_list_sp).flatten().cpu().numpy()
 
-        aupro_px = compute_pro(gt_list_px, pr_list_px)
+        # Ensure boolean masks. In some cases a whole eval set/batch may contain no anomalies.
+        masks_np = gt_list_px.astype(bool)
+        uniq = np.unique(masks_np)
+        if uniq.size < 2:
+            # PRO is undefined if either positives or negatives are missing; set to 0.0
+            aupro_px = 0.0
+        else:
+            aupro_px = compute_pro(masks_np, pr_list_px)
 
         gt_list_px, pr_list_px = gt_list_px.ravel(), pr_list_px.ravel()
 
@@ -649,53 +656,72 @@ def visualize_loco(model, dataloader, device, _class_='None', save_name='save'):
 
 
 def compute_pro(masks: ndarray, amaps: ndarray, num_th: int = 200) -> None:
-    """Compute the area under the curve of per-region overlaping (PRO) and 0 to 0.3 FPR
+    """Compute the area under the curve of per-region overlapping (PRO) and 0 to 0.3 FPR.
+    Accepts boolean or 0/1 masks and normalizes internally.
     Args:
-        category (str): Category of product
-        masks (ndarray): All binary masks in test. masks.shape -> (num_test_data, h, w)
-        amaps (ndarray): All anomaly maps in test. amaps.shape -> (num_test_data, h, w)
-        num_th (int, optional): Number of thresholds
+        masks (ndarray): Binary masks, shape (N, H, W). dtype can be bool or numeric (0/1).
+        amaps (ndarray): Anomaly maps, shape (N, H, W), continuous scores.
+        num_th (int): Number of thresholds.
     """
 
     assert isinstance(amaps, ndarray), "type(amaps) must be ndarray"
     assert isinstance(masks, ndarray), "type(masks) must be ndarray"
-    assert amaps.ndim == 3, "amaps.ndim must be 3 (num_test_data, h, w)"
-    assert masks.ndim == 3, "masks.ndim must be 3 (num_test_data, h, w)"
+    assert amaps.ndim == 3 and masks.ndim == 3, "amaps and masks must be (N,H,W)"
     assert amaps.shape == masks.shape, "amaps.shape and masks.shape must be same"
-    assert set(masks.flatten()) == {0, 1}, "set(masks.flatten()) must be {0, 1}"
     assert isinstance(num_th, int), "type(num_th) must be int"
 
-    df = pd.DataFrame([], columns=["pro", "fpr", "threshold"])
-    binary_amaps = np.zeros_like(amaps, dtype=np.bool)
+    # Normalize masks to boolean
+    if masks.dtype != bool:
+        masks = masks > 0
 
-    min_th = amaps.min()
-    max_th = amaps.max()
+    # If there are not both positives and negatives, PRO is undefined
+    uniq = np.unique(masks)
+    if uniq.size < 2:
+        return 0.0
+
+    df = pd.DataFrame([], columns=["pro", "fpr", "threshold"])
+    binary_amaps = np.zeros_like(amaps, dtype=bool)
+
+    min_th = float(amaps.min())
+    max_th = float(amaps.max())
+    if num_th <= 0 or max_th <= min_th:
+        return 0.0
     delta = (max_th - min_th) / num_th
 
     for th in np.arange(min_th, max_th, delta):
-        binary_amaps[amaps <= th] = 0
-        binary_amaps[amaps > th] = 1
+        np.less_equal(amaps, th, out=binary_amaps)
+        # above-threshold -> 1
+        binary_amaps = ~binary_amaps
 
         pros = []
         for binary_amap, mask in zip(binary_amaps, masks):
-            for region in measure.regionprops(measure.label(mask)):
+            labeled = measure.label(mask)
+            regions = measure.regionprops(labeled)
+            for region in regions:
                 axes0_ids = region.coords[:, 0]
                 axes1_ids = region.coords[:, 1]
                 tp_pixels = binary_amap[axes0_ids, axes1_ids].sum()
-                pros.append(tp_pixels / region.area)
+                pros.append(tp_pixels / (region.area if region.area > 0 else 1))
 
-        inverse_masks = 1 - masks
-        fp_pixels = np.logical_and(inverse_masks, binary_amaps).sum()
-        fpr = fp_pixels / inverse_masks.sum()
+        inverse_masks = np.logical_not(masks)
+        denom = inverse_masks.sum()
+        fpr = (np.logical_and(inverse_masks, binary_amaps).sum() / denom) if denom > 0 else 0.0
 
-        df = df.append({"pro": mean(pros), "fpr": fpr, "threshold": th}, ignore_index=True)
+        df = pd.concat([df, pd.DataFrame({"pro": mean(pros) if len(pros) > 0 else 0.0,
+                                           "fpr": fpr,
+                                           "threshold": th}, index=[0])], ignore_index=True)
 
     # Normalize FPR from 0 ~ 1 to 0 ~ 0.3
     df = df[df["fpr"] < 0.3]
-    df["fpr"] = df["fpr"] / df["fpr"].max()
+    if df.empty:
+        return 0.0
+    max_fpr = df["fpr"].max()
+    if max_fpr > 0:
+        df["fpr"] = df["fpr"] / max_fpr
+    else:
+        df["fpr"] = 0.0
 
-    pro_auc = auc(df["fpr"], df["pro"])
-    return pro_auc
+    return auc(df["fpr"], df["pro"]) if len(df) > 1 else 0.0
 
 
 def get_gaussian_kernel(kernel_size=3, sigma=2, channels=1):

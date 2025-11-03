@@ -28,7 +28,7 @@ try:
         from xformers.ops import fmha, scaled_index_add, index_select_cat
 
         XFORMERS_AVAILABLE = True
-        warnings.warn("xFormers is available (Block)")
+        # warnings.warn("xFormers is available (Block)")
     else:
         warnings.warn("xFormers is disabled (Block)")
         raise ImportError
@@ -112,7 +112,16 @@ class Block(nn.Module):
     #     return x
 
     def forward(self, x, return_attention=False):
-        y, attn = self.attn(self.norm1(x))
+        out = self.attn(self.norm1(x))
+        # Robustly handle different attention return signatures
+        attn = None
+        if isinstance(out, tuple):
+            # Some attention implementations may return (y,), (y, attn), or (y, attn, extra...)
+            y = out[0]
+            if len(out) > 1:
+                attn = out[1]
+        else:
+            y = out
 
         x = x + self.ls1(y)
         x = x + self.ls2(self.mlp(self.norm2(x)))

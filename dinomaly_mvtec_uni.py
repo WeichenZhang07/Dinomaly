@@ -194,7 +194,7 @@ def train(item_list):
             loss_list.append(loss.item())
             lr_scheduler.step()
 
-            if (it + 1) % 5000 == 0:
+            if (it + 1) % 100 == 0:
                 # torch.save(model.state_dict(), os.path.join(args.save_dir, args.save_name, 'model.pth'))
 
                 auroc_sp_list, ap_sp_list, f1_sp_list = [], [], []
@@ -240,7 +240,7 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(description='')
-    parser.add_argument('--data_path', type=str, default='../mvtec_anomaly_detection')
+    parser.add_argument('--data_path', type=str, default='/root/autodl-tmp/mvtec_anomaly_detection')
     parser.add_argument('--save_dir', type=str, default='./saved_results')
     parser.add_argument('--save_name', type=str,
                         default='vitill_mvtec_uni_dinov2br_c392_en29_bn4dp2_de8_laelu_md2_i1_it10k_sams2e3_wd1e4_w1hcosa2e4_ghmp09f01w01_b16_s1')
@@ -251,7 +251,7 @@ if __name__ == '__main__':
     logger = get_logger(args.save_name, os.path.join(args.save_dir, args.save_name))
     print_fn = logger.info
 
-    device = 'cuda:1' if torch.cuda.is_available() else 'cpu'
+    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     print_fn(device)
 
     train(item_list)
