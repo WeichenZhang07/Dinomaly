@@ -88,18 +88,18 @@ def build_datasets_ad2(data_root, classnames, imagesize=392):
             classname=cls,
             imagesize=imagesize,
             split=DatasetSplit.TRAIN,
-            preserve_aspect_ratio=True,
+            preserve_aspect_ratio=False,
             resize_strategy='short_side',
-            center_crop=True,
+            center_crop=False,
         )
         test_ds = MVTecAD2Dataset(
             source=data_root,
             classname=cls,
             imagesize=imagesize,
             split=DatasetSplit.TEST,
-            preserve_aspect_ratio=True,
+            preserve_aspect_ratio=False,
             resize_strategy='short_side',
-            center_crop=True,
+            center_crop=False,
         )
         train_datasets.append(train_ds)
         test_adapters.append(AD2EvalAdapter(test_ds))
@@ -202,6 +202,9 @@ def train_ad2(args):
     print_fn(f"item_list: {','.join(item_list)}")
     if imagesize_rounded != imagesize:
         print_fn(f"[note] imagesize adjusted from {imagesize} to {imagesize_rounded} to match patch size {patch}.")
+    # checkpoint dir
+    ckpt_dir = os.path.join(args.save_dir, args.save_name)
+    os.makedirs(ckpt_dir, exist_ok=True)
 
     it = 0
     for epoch in range(int(np.ceil(total_iters / len(train_loader)))):
@@ -254,12 +257,27 @@ def train_ad2(args):
 
                 model.train()
 
+            # periodic checkpoint saving
+            if (it + 1) % args.save_every == 0:
+                ckpt_path = os.path.join(ckpt_dir, f"model_iter_{it+1}.pth")
+                print_fn(f"Saving checkpoint: {ckpt_path}")
+                torch.save({
+                    'iter': it + 1,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'lr_scheduler': lr_scheduler.schedule if hasattr(lr_scheduler, 'schedule') else None,
+                }, ckpt_path)
+
             it += 1
             if it >= total_iters:
                 break
         print_fn('iter [{}/{}], loss:{:.4f}'.format(it, total_iters, np.mean(loss_list)))
         if it >= total_iters:
             break
+    # final checkpoint
+    final_path = os.path.join(ckpt_dir, 'model_final.pth')
+    print_fn(f"Saving final model to {final_path}")
+    torch.save({'iter': it, 'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict()}, final_path)
 
 
 def parse_args():
@@ -271,10 +289,11 @@ def parse_args():
     parser.add_argument('--encoder_name', type=str, default='dinov2reg_vit_base_14')
     parser.add_argument('--classes', type=str, default='can', help='Comma-separated class list; empty=all')
     parser.add_argument('--item_list', type=str, default='', help='Alias of --classes; takes priority if set')
-    parser.add_argument('--batch_size', type=int, default=2)
+    parser.add_argument('--batch_size', type=int, default=5)
     parser.add_argument('--imagesize', type=int, default=1022)
     parser.add_argument('--total_iters', type=int, default=10000)
-    parser.add_argument('--eval_every', type=int, default=100)
+    parser.add_argument('--eval_every', type=int, default=1000)
+    parser.add_argument('--save_every', type=int, default=1000, help='Save checkpoint every N iterations')
     parser.add_argument('--lr', type=float, default=2e-3)
     parser.add_argument('--lr_final', type=float, default=2e-4)
     args = parser.parse_args()
