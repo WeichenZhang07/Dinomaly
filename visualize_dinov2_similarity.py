@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 import matplotlib
-matplotlib.use('Agg')  # non-interactive backend for headless save
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from dataset import get_data_transforms
@@ -20,7 +20,6 @@ def is_image_file(p: str) -> bool:
 
 
 def expand_errors_path(errors: str) -> List[str]:
-    # Accept: directory, text file (one path per line), single image, or glob pattern
     if os.path.isdir(errors):
         paths = []
         for ext in ('*.png', '*.jpg', '*.jpeg', '*.bmp', '*.tif', '*.tiff', '*.webp'):
@@ -31,9 +30,7 @@ def expand_errors_path(errors: str) -> List[str]:
             with open(errors, 'r') as f:
                 lines = [ln.strip() for ln in f.readlines()]
             return [ln for ln in lines if ln and is_image_file(ln)]
-        # Single file
         return [errors]
-    # glob pattern
     paths = glob.glob(errors)
     return [p for p in paths if is_image_file(p)]
 
@@ -43,7 +40,6 @@ def load_image(path: str) -> Image.Image:
 
 
 def round_to_multiple(x: int, m: int) -> int:
-    # round to nearest multiple of m, with minimum m
     r = int(round(x / m) * m)
     return max(m, r)
 
@@ -51,10 +47,6 @@ def round_to_multiple(x: int, m: int) -> int:
 def preprocess_resize_to_patch_multiple(img: Image.Image, patch_hw: Tuple[int, int],
                                         target_size: Tuple[int, int] = None,
                                         mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)) -> Tuple[torch.Tensor, np.ndarray, Tuple[int, int]]:
-    """
-    Resize image to a rectangle whose width/height are multiples of patch size, optionally to a provided target_size.
-    Returns: tensor [1,3,H,W], resized RGB image as uint8 numpy array for overlay, and (W, H).
-    """
     if target_size is None:
         w, h = img.size
         pw, ph = patch_hw[1], patch_hw[0]
@@ -64,22 +56,18 @@ def preprocess_resize_to_patch_multiple(img: Image.Image, patch_hw: Tuple[int, i
         Wt, Ht = target_size
 
     img_resized = img.resize((Wt, Ht), resample=Image.BICUBIC)
-    np_img = np.array(img_resized).astype(np.float32) / 255.0  # H, W, 3 in [0,1]
-    # Normalize
+    np_img = np.array(img_resized).astype(np.float32) / 255.0
     x = np_img.copy()
     mean = np.array(mean, dtype=np.float32)
     std = np.array(std, dtype=np.float32)
     x = (x - mean[None, None, :]) / std[None, None, :]
-    x = np.transpose(x, (2, 0, 1))  # 3,H,W
-    tensor = torch.from_numpy(x).unsqueeze(0)  # 1,3,H,W
+    x = np.transpose(x, (2, 0, 1))
+    tensor = torch.from_numpy(x).unsqueeze(0)
     return tensor, (np_img * 255.0).astype(np.uint8), (Wt, Ht)
 
 
-def extract_layer_tokens(encoder, x: torch.Tensor, target_layers: List[int]) -> List[torch.Tensor]:
-    """
-    Returns a list of tensors (one per layer index in target_layers), each with shape [1, N_tokens, C].
-    This mirrors the extraction pattern used in models.uad.ViTill.
-    """
+def extract_layer_tokens_vit(encoder, x: torch.Tensor, target_layers: List[int]) -> List[torch.Tensor]:
+    """For ViT / DINOv2 encoders"""
     with torch.no_grad():
         x = encoder.prepare_tokens(x)
         feats = []
@@ -93,13 +81,72 @@ def extract_layer_tokens(encoder, x: torch.Tensor, target_layers: List[int]) -> 
     return feats
 
 
+def _donut_flat_blocks(encoder) -> List[torch.nn.Module]:
+    """Flatten Donut encoder blocks to a simple list (supports Swin/ViT backbones)."""
+    enc = encoder.encoder if hasattr(encoder, "encoder") else encoder
+    blocks = []
+    # Swin-style: enc.layers = [SwinStage,...], each has .blocks (SwinBlock list)
+    if hasattr(enc, "layers"):
+        for stage in enc.layers:
+            if hasattr(stage, "blocks"):
+                blocks.extend(list(stage.blocks))
+            else:
+                blocks.append(stage)
+    # ViT-style: enc.layer = [EncoderLayer,...]
+    elif hasattr(enc, "layer"):
+        for layer in enc.layer:
+            # Some ViT impls may have sub-blocks
+            if hasattr(layer, "blocks"):
+                blocks.extend(list(layer.blocks))
+            else:
+                blocks.append(layer)
+    else:
+        # Fallback: all children as sequence
+        blocks = list(enc.children())
+    return blocks
+
+
+def extract_layer_tokens_donut(encoder, x: torch.Tensor, target_layers: List[int]) -> List[torch.Tensor]:
+    """For Donut encoder (ViT or Swin): hook flattened blocks and collect outputs."""
+    feats: List[torch.Tensor] = []
+    hooks: dict = {}
+
+    def save_output_hook(name):
+        def hook_fn(module, inp, out):
+            hooks[name] = out
+        return hook_fn
+
+    flat_blocks = _donut_flat_blocks(encoder)
+    if len(flat_blocks) == 0:
+        raise RuntimeError("Donut encoder has no discoverable blocks to hook.")
+
+    # Filter target indices to available range
+    sel_indices = [i for i in target_layers if 0 <= i < len(flat_blocks)]
+    missing_indices = sorted(set(target_layers) - set(sel_indices))
+    if missing_indices:
+        print(f"[WARN] Donut: skipping non-existent layer indices: {missing_indices} (total blocks={len(flat_blocks)})")
+
+    # Register hooks
+    handles = []
+    for i in sel_indices:
+        handles.append(flat_blocks[i].register_forward_hook(save_output_hook(f"blk{i}")))
+
+    with torch.no_grad():
+        _ = encoder(x)
+
+    for h in handles:
+        h.remove()
+
+    # Collect in requested order (only those that exist)
+    for i in sel_indices:
+        if f"blk{i}" in hooks:
+            feats.append(hooks[f"blk{i}"])
+        else:
+            print(f"[WARN] Donut: hook for layer {i} did not fire; skipping.")
+    return feats
+
+
 def tokens_to_patch_grid(x: torch.Tensor, num_register_tokens: int, h_patches: int, w_patches: int) -> Tuple[torch.Tensor, Tuple[int, int]]:
-    """
-    Convert tokens [1, N_tokens, C] to patch tokens [1, HW, C] and return (tokens, side).
-    CLS token and register tokens are removed.
-    """
-    assert x.ndim == 3 and x.shape[0] == 1
-    # drop CLS + register tokens
     x_no_cls = x[:, 1 + num_register_tokens:, :]
     hw = x_no_cls.shape[1]
     assert h_patches * w_patches == hw, f"Token grid mismatch: got {hw}, expected {h_patches}x{w_patches}"
@@ -107,39 +154,95 @@ def tokens_to_patch_grid(x: torch.Tensor, num_register_tokens: int, h_patches: i
 
 
 def cosine_map_per_patch(ref_tokens: torch.Tensor, err_tokens: torch.Tensor) -> torch.Tensor:
-    """
-    ref_tokens, err_tokens: [1, HW, C]
-    Return: [H, W] similarity map in [0,1] (absolute cosine similarity)
-    """
     ref_norm = F.normalize(ref_tokens, dim=-1)
     err_norm = F.normalize(err_tokens, dim=-1)
-    sim = (ref_norm * err_norm).sum(dim=-1)  # [1, HW]
-    sim = sim.squeeze(0)  # [HW]
-    sim_abs = sim.abs()  # [0,1]
+    sim = (ref_norm * err_norm).sum(dim=-1)
+    sim_abs = sim.abs()
     return sim_abs
 
 
 def overlay_heatmap_on_image(sim_map: np.ndarray, base_rgb_uint8: np.ndarray, alpha: float = 0.5,
                              cmap_name: str = 'coolwarm') -> np.ndarray:
-    """
-    sim_map: [H, W] in [0,1]
-    base_rgb_uint8: [H, W, 3] uint8
-    Returns blended image uint8
-    """
     import matplotlib.cm as cm
-    h, w = sim_map.shape
-    # colormap to RGB [0,1]
     cmap = cm.get_cmap(cmap_name)
-    cm_rgb = cmap(sim_map)[..., :3]  # drop alpha
+    cm_rgb = cmap(sim_map)[..., :3]
     base = base_rgb_uint8.astype(np.float32) / 255.0
     out = (1 - alpha) * base + alpha * cm_rgb
-    out = np.clip(out * 255.0, 0, 255).astype(np.uint8)
+    return np.clip(out * 255.0, 0, 255).astype(np.uint8)
+
+
+def _first_tensor(obj):
+    """Return the first torch.Tensor found within obj (tensor/tuple/list/dict), else obj if it's tensor, else None."""
+    if torch.is_tensor(obj):
+        return obj
+    if isinstance(obj, (list, tuple)):
+        for it in obj:
+            t = _first_tensor(it)
+            if torch.is_tensor(t):
+                return t
+        return None
+    if isinstance(obj, dict):
+        for v in obj.values():
+            t = _first_tensor(v)
+            if torch.is_tensor(t):
+                return t
+        return None
+    return None
+
+
+def _infer_hw_from_n(n: int, Ht: int, Wt: int) -> Tuple[int, int]:
+    """Infer an HxW grid from token count n using image aspect ratio as guidance."""
+    import math
+    target_ratio = Ht / max(1, Wt)
+    best = (int(math.sqrt(n)), int(math.sqrt(n)))
+    best_err = float('inf')
+    for h in range(1, int(math.sqrt(n)) + 1):
+        if n % h == 0:
+            w = n // h
+            ratio = h / max(1, w)
+            err = abs(ratio - target_ratio)
+            if err < best_err:
+                best_err = err
+                best = (h, w)
+    return best
+
+
+def feats_to_tokens_and_grid(feats: List[torch.Tensor], default_grid: Tuple[int, int] | None,
+                             Ht: int, Wt: int) -> List[Tuple[torch.Tensor, Tuple[int, int] | None]]:
+    """Normalize layer outputs to (tokens[B,N,C], grid_hw or None) pairs.
+
+    - If feat is 4D (B,C,H,W): return tokens and (H,W)
+    - If feat is 3D (B,N,C): return tokens and default_grid (may be None)
+    - If feat is tuple/list/dict: use the first tensor found within
+    """
+    out = []
+    for f in feats:
+        t = _first_tensor(f)
+        if t is None:
+            # fall back to original if it is a tensor already
+            t = f if torch.is_tensor(f) else None
+        if t is None:
+            raise RuntimeError("Layer output does not contain a tensor.")
+        if t.ndim == 4:
+            B, C, h, w = t.shape
+            tok = t.flatten(2).transpose(1, 2)
+            out.append((tok, (h, w)))
+        elif t.ndim == 3:
+            tok = t
+            if default_grid is None:
+                # try to infer grid from token count and image aspect
+                n = tok.shape[1]
+                grid = _infer_hw_from_n(n, Ht, Wt)
+            else:
+                grid = default_grid
+            out.append((tok, grid))
+        else:
+            raise RuntimeError(f"Unsupported feature ndim={t.ndim}")
     return out
 
 
 def plot_layers_heatmaps(sim_maps: List[np.ndarray], layers: List[int], out_path: str, cmap: str = 'coolwarm'):
     n = len(sim_maps)
-    # Layout: Try to keep rows small
     cols = min(4, n)
     rows = int(np.ceil(n / cols))
     fig, axes = plt.subplots(rows, cols, figsize=(3.5 * cols, 3.5 * rows), squeeze=False)
@@ -150,121 +253,123 @@ def plot_layers_heatmaps(sim_maps: List[np.ndarray], layers: List[int], out_path
         im = ax.imshow(sim, vmin=vmin, vmax=vmax, cmap=cmap, origin='upper')
         ax.set_title(f"Layer {layers[idx]}")
         ax.axis('off')
-    # hide any extra axes
     for k in range(n, rows * cols):
         r, c = divmod(k, cols)
         axes[r][c].axis('off')
     fig.tight_layout()
-    # add a single colorbar
     cbar = fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.9)
     cbar.set_label('abs(cosine similarity)')
     fig.savefig(out_path, bbox_inches='tight')
     plt.close(fig)
 
 
-def save_single_layer_maps(sim_maps: List[np.ndarray], layers: List[int], base_out: str, cmap: str = 'coolwarm'):
-    vmin, vmax = 0.0, 1.0
-    for sim, lidx in zip(sim_maps, layers):
-        fig = plt.figure(figsize=(4, 4))
-        plt.imshow(sim, vmin=vmin, vmax=vmax, cmap=cmap, origin='upper')
-        plt.axis('off')
-        out_path = f"{base_out}_layer{lidx:02d}.png"
-        plt.savefig(out_path, bbox_inches='tight', pad_inches=0)
-        plt.close(fig)
-
-
 def main():
-    parser = argparse.ArgumentParser(description='Layer-wise absolute cosine similarity visualization (dinov2).')
-    parser.add_argument('--ref', type=str, required=True, help='Path to reference (normal) image')
-    parser.add_argument('--errors', type=str, required=True, help='Path to error images (dir, glob, txt, or single)')
-    parser.add_argument('--output_dir', type=str, default='./similarity_outputs', help='Directory to save results')
-    parser.add_argument('--encoder_name', type=str, default='dinov2reg_vit_base_14', help='Encoder name as used in repo')
-    parser.add_argument('--layers', type=str, default='all', help='Comma-separated block indices or "all"')
-    parser.add_argument('--device', type=str, default=None, help='cuda:0 or cpu; default auto')
-    parser.add_argument('--save_individual', action='store_true', help='Also save each layer heatmap separately')
-    parser.add_argument('--alpha', type=float, default=0.5, help='Overlay alpha for heatmap')
+    parser = argparse.ArgumentParser(description='Layer-wise similarity visualization (DINOv2 / Donut).')
+    parser.add_argument('--ref', type=str, required=True)
+    parser.add_argument('--errors', type=str, required=True)
+    parser.add_argument('--output_dir', type=str, default='./similarity_outputs')
+    parser.add_argument('--encoder_type', type=str, default='dinov2', choices=['dinov2', 'donut'])
+    parser.add_argument('--encoder_name', type=str, default='dinov2reg_vit_base_14')
+    parser.add_argument('--layers', type=str, default='all')
+    parser.add_argument('--device', type=str, default=None)
+    parser.add_argument('--alpha', type=float, default=0.5)
+    parser.add_argument('--cmap', type=str, default='coolwarm', help='Colormap for score-only visualization')
 
     args = parser.parse_args()
-
     os.makedirs(args.output_dir, exist_ok=True)
-
     device = args.device or ('cuda:0' if torch.cuda.is_available() else 'cpu')
-    # Disable xFormers on CPU to avoid unsupported ops
-    if str(device).startswith('cpu') or not torch.cuda.is_available():
-        os.environ["XFORMERS_DISABLED"] = "1"
 
-    # Import after environment is set
-    from models import vit_encoder
+    # ========= Load Encoder ==========
+    if args.encoder_type == 'dinov2':
+        from models import vit_encoder
+        encoder = vit_encoder.load(args.encoder_name).eval().to(device)
+        patch_h, patch_w = encoder.patch_embed.patch_size
+        num_register_tokens = getattr(encoder, 'num_register_tokens', 0)
+        extract_fn = extract_layer_tokens_vit
 
-    # Load encoder (same path used by training scripts)
-    encoder = vit_encoder.load(args.encoder_name)
-    encoder.eval().to(device)
+    elif args.encoder_type == 'donut':
+        from transformers import DonutProcessor, VisionEncoderDecoderModel
+        processor = DonutProcessor.from_pretrained("naver-clova-ix/donut-base")
+        model = VisionEncoderDecoderModel.from_pretrained("naver-clova-ix/donut-base")
+        encoder = model.encoder.eval().to(device)
+        patch_h, patch_w = (14, 14)  # approximate ViT patch size
+        num_register_tokens = 0
+        extract_fn = extract_layer_tokens_donut
 
-    # Determine num_register_tokens for token slicing
-    num_register_tokens = getattr(encoder, 'num_register_tokens', 0)
-    # Determine patch size
-    patch_h, patch_w = encoder.patch_embed.patch_size
-
-    # Parse layers
+    # ========= Parse Layers ==========
+    if args.encoder_type == 'dinov2':
+        total_layers = len(encoder.blocks) if hasattr(encoder, "blocks") else 12
+    else:
+        total_layers = len(_donut_flat_blocks(encoder))
     if args.layers.strip().lower() == 'all':
-        total_layers = len(encoder.blocks)
         target_layers = list(range(total_layers))
     else:
         target_layers = [int(x) for x in args.layers.split(',') if x.strip() != '']
 
-    # Load reference image tensor
+    # ========= Reference ==========
     ref_img = load_image(args.ref)
-    # Compute target size from reference image (multiples of patch)
     ref_tensor_cpu, ref_rgb_uint8, (Wt, Ht) = preprocess_resize_to_patch_multiple(ref_img, (patch_h, patch_w))
     ref_tensor = ref_tensor_cpu.to(device)
-    h_patches = Ht // patch_h
-    w_patches = Wt // patch_w
+    h_patches, w_patches = Ht // patch_h, Wt // patch_w
+    ref_feats = extract_fn(encoder, ref_tensor, target_layers)
+    # For ViT path, default grid is patch grid; for Donut, let it infer or use 4D shapes
+    default_grid = (h_patches, w_patches) if args.encoder_type == 'dinov2' else None
+    ref_pairs = feats_to_tokens_and_grid(ref_feats, default_grid, Ht, Wt)
 
-    # Extract reference per-layer tokens
-    ref_feats = extract_layer_tokens(encoder, ref_tensor, target_layers)
-    ref_tokens = []
-    for ft in ref_feats:
-        toks, _ = tokens_to_patch_grid(ft, num_register_tokens, h_patches, w_patches)
-        ref_tokens.append(toks)
-
-    # Errors list
+    # ========= Error Images ==========
     error_paths = expand_errors_path(args.errors)
-    if len(error_paths) == 0:
-        raise RuntimeError(f"No error images found from: {args.errors}")
-
     for err_path in error_paths:
-        try:
-            err_img = load_image(err_path)
-            # Resize to the SAME target size as reference for valid patch-wise comparison
-            err_tensor_cpu, err_rgb_uint8, _ = preprocess_resize_to_patch_multiple(err_img, (patch_h, patch_w), (Wt, Ht))
-            err_tensor = err_tensor_cpu.to(device)
+        err_img = load_image(err_path)
+        err_tensor_cpu, err_rgb_uint8, _ = preprocess_resize_to_patch_multiple(err_img, (patch_h, patch_w), (Wt, Ht))
+        err_tensor = err_tensor_cpu.to(device)
+        err_feats = extract_fn(encoder, err_tensor, target_layers)
+        err_pairs = feats_to_tokens_and_grid(err_feats, default_grid, Ht, Wt)
 
-            err_feats = extract_layer_tokens(encoder, err_tensor, target_layers)
-            sim_maps = []
-            for (rf, ef) in zip(ref_tokens, err_feats):
-                etoks, _ = tokens_to_patch_grid(ef, num_register_tokens, h_patches, w_patches)
-                sim = cosine_map_per_patch(rf, etoks).detach().cpu().numpy().reshape(h_patches, w_patches)
-                sim_maps.append(sim)
+        sim_maps = []
+        for (rf, rgrid), (ef, egrid) in zip(ref_pairs, err_pairs):
+            # Ensure both token sequences match length
+            if rf.shape[1] != ef.shape[1]:
+                # If shapes differ (e.g., due to strides), interpolate to the smaller token length via spatial maps
+                # Prefer converting both back to spatial using their grids then aligning
+                rH, rW = rgrid if rgrid is not None else _infer_hw_from_n(rf.shape[1], Ht, Wt)
+                eH, eW = egrid if egrid is not None else _infer_hw_from_n(ef.shape[1], Ht, Wt)
+                # Reshape to (B,C,H,W) by transposing tokens back
+                rf_4d = rf.transpose(1, 2).reshape(rf.shape[0], rf.shape[2], rH, rW)
+                ef_4d = ef.transpose(1, 2).reshape(ef.shape[0], ef.shape[2], eH, eW)
+                # Match to the larger spatial size for better fidelity
+                tgtH, tgtW = max(rH, eH), max(rW, eW)
+                rf_4d = F.interpolate(rf_4d, size=(tgtH, tgtW), mode='bilinear', align_corners=False)
+                ef_4d = F.interpolate(ef_4d, size=(tgtH, tgtW), mode='bilinear', align_corners=False)
+                rf = rf_4d.flatten(2).transpose(1, 2)
+                ef = ef_4d.flatten(2).transpose(1, 2)
+                grid = (tgtH, tgtW)
+            else:
+                grid = rgrid if rgrid is not None else egrid
+                if grid is None:
+                    grid = _infer_hw_from_n(rf.shape[1], Ht, Wt)
 
-            # Save combined grid (heatmaps only)
-            base = os.path.splitext(os.path.basename(err_path))[0]
-            out_combined = os.path.join(args.output_dir, f"{base}_layers.png")
-            plot_layers_heatmaps(sim_maps, target_layers, out_combined, cmap='coolwarm')
+            sim = cosine_map_per_patch(rf, ef).detach().cpu().numpy().reshape(grid[0], grid[1])
+            sim_maps.append(sim)
 
-            # Save per-layer overlay masks on the resized input image
-            for sim, lidx in zip(sim_maps, target_layers):
-                # upscale sim to resized dims
-                sim_up = torch.from_numpy(sim).unsqueeze(0).unsqueeze(0).float()
-                sim_up = F.interpolate(sim_up, size=(Ht, Wt), mode='bilinear', align_corners=False).squeeze().numpy()
-                overlay = overlay_heatmap_on_image(sim_up, err_rgb_uint8, alpha=args.alpha, cmap_name='coolwarm')
-                out_overlay = os.path.join(args.output_dir, f"{base}_layer{lidx:02d}_overlay.png")
-                Image.fromarray(overlay).save(out_overlay)
+        base = os.path.splitext(os.path.basename(err_path))[0]
+        out_combined = os.path.join(args.output_dir, f"{base}_layers.png")
+        plot_layers_heatmaps(sim_maps, target_layers, out_combined)
 
-            # Also save a .npz with raw data for programmatic use
-            npz_path = os.path.join(args.output_dir, f"{base}_simmaps.npz")
-            np.savez_compressed(npz_path, layers=np.array(target_layers), maps=np.array(sim_maps, dtype=np.float32))
-        except Exception as e:
-            print(f"[WARN] Failed on {err_path}: {e}")
+        for sim, lidx in zip(sim_maps, target_layers):
+            sim_up = torch.from_numpy(sim).unsqueeze(0).unsqueeze(0).float()
+            sim_up = F.interpolate(sim_up, size=(Ht, Wt), mode='bilinear', align_corners=False).squeeze().numpy()
+
+            # Save overlay (scores on top of image)
+            overlay = overlay_heatmap_on_image(sim_up, err_rgb_uint8, alpha=args.alpha, cmap_name=args.cmap)
+            out_overlay = os.path.join(args.output_dir, f"{base}_layer{lidx:02d}_overlay.png")
+            Image.fromarray(overlay).save(out_overlay)
+
+            # Save standalone score visualization (heatmap only) to avoid background interference
+            sim_norm = (sim_up - sim_up.min()) / (sim_up.max() - sim_up.min() + 1e-8)
+            cmap = plt.get_cmap(args.cmap)
+            sim_rgb = (cmap(sim_norm)[..., :3] * 255.0).astype(np.uint8)
+            out_scores = os.path.join(args.output_dir, f"{base}_layer{lidx:02d}_scores.png")
+            Image.fromarray(sim_rgb).save(out_scores)
 
 
 if __name__ == '__main__':
