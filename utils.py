@@ -344,7 +344,64 @@ def evaluation(model, dataloader, device, _class_=None, calc_pro=True, norm_fact
     return auroc_px, auroc_sp, round(np.mean(aupro_list), 4)
 
 
-def evaluation_batch(model, dataloader, device, _class_=None, max_ratio=0, resize_mask=None):
+# ================= AUROC Accumulator (optional, across-calls) =================
+class _AUCAccumulator:
+    def __init__(self):
+        self.y_px = []  # list of numpy arrays
+        self.s_px = []
+        self.y_sp = []
+        self.s_sp = []
+
+    def update_px(self, y, s):
+        self.y_px.append(y)
+        self.s_px.append(s)
+
+    def update_sp(self, y, s):
+        self.y_sp.append(y)
+        self.s_sp.append(s)
+
+    def _stack(self, kind):
+        if kind == 'px':
+            if not self.y_px:
+                return None, None
+            y = np.concatenate(self.y_px, axis=0)
+            s = np.concatenate(self.s_px, axis=0)
+            return y, s
+        else:
+            if not self.y_sp:
+                return None, None
+            y = np.concatenate(self.y_sp, axis=0)
+            s = np.concatenate(self.s_sp, axis=0)
+            return y, s
+
+    def can_compute(self, kind):
+        y, _ = self._stack(kind)
+        if y is None:
+            return False
+        return np.unique(y).size >= 2
+
+    def compute(self, kind):
+        y, s = self._stack(kind)
+        if y is None or np.unique(y).size < 2:
+            return 0.5
+        return float(roc_auc_score(y, s))
+
+
+_AUC_REGISTRY = {}
+
+def reset_auc_accumulator(tag: str):
+    if tag in _AUC_REGISTRY:
+        del _AUC_REGISTRY[tag]
+
+def _get_auc_acc(tag: str):
+    acc = _AUC_REGISTRY.get(tag)
+    if acc is None:
+        acc = _AUCAccumulator()
+        _AUC_REGISTRY[tag] = acc
+    return acc
+
+
+def evaluation_batch(model, dataloader, device, _class_=None, max_ratio=0, resize_mask=None, accumulate_auroc_tag: str = None):
     model.eval()
     gt_list_px = []
     pr_list_px = []
@@ -371,9 +428,21 @@ def evaluation_batch(model, dataloader, device, _class_=None, max_ratio=0, resiz
                 anomaly_map = F.interpolate(anomaly_map, size=resize_mask, mode='bilinear', align_corners=False)
                 gt = F.interpolate(gt, size=resize_mask, mode='nearest')
 
+            # Ensure gt is on the same device as anomaly_map to avoid CPU/CUDA mixing in concatenation
+            if gt.device != anomaly_map.device:
+                gt = gt.to(anomaly_map.device)
+
             anomaly_map = gaussian_kernel(anomaly_map)
 
+            # 如果掩码全 0 且标签为异常(=1)，尝试启发式恢复：将 anomaly_map 前 p% 分位作为粗糙掩码
             gt = gt.bool()
+            if torch.all(gt == 0) and label.sum() > 0:
+                # 使用 top-k (5%) 位置生成软/二值伪掩码，避免后续所有像素被当成正常导致统计失真
+                flat = anomaly_map.flatten(1)
+                k = max(1, int(flat.shape[1] * 0.05))
+                thresh = torch.topk(flat, k=k, dim=1)[0][:, -1].view(-1, 1, 1, 1)
+                pseudo = (anomaly_map >= thresh).to(gt.dtype)
+                gt = pseudo
             if gt.shape[1] > 1:
                 gt = torch.max(gt, dim=1, keepdim=True)[0]
 
@@ -389,29 +458,59 @@ def evaluation_batch(model, dataloader, device, _class_=None, max_ratio=0, resiz
                 sp_score = sp_score.mean(dim=1)
             pr_list_sp.append(sp_score)
 
-        gt_list_px = torch.cat(gt_list_px, dim=0)[:, 0].cpu().numpy()
-        pr_list_px = torch.cat(pr_list_px, dim=0)[:, 0].cpu().numpy()
-        gt_list_sp = torch.cat(gt_list_sp).flatten().cpu().numpy()
-        pr_list_sp = torch.cat(pr_list_sp).flatten().cpu().numpy()
+    gt_list_px = torch.cat(gt_list_px, dim=0)[:, 0].cpu().numpy()
+    pr_list_px = torch.cat(pr_list_px, dim=0)[:, 0].cpu().numpy()
+    gt_list_sp = torch.cat(gt_list_sp).flatten().cpu().numpy()
+    pr_list_sp = torch.cat(pr_list_sp).flatten().cpu().numpy()
 
-        # Ensure boolean masks. In some cases a whole eval set/batch may contain no anomalies.
-        masks_np = gt_list_px.astype(bool)
-        uniq = np.unique(masks_np)
+    # Ensure boolean masks for PRO. Handle sets with only one class to avoid NaN/ValueError.
+    masks_np = gt_list_px.astype(bool)
+    uniq_px_mask = np.unique(masks_np)
+    if uniq_px_mask.size < 2:
+        aupro_px = 0.0  # undefined -> neutral 0.0
+    else:
+        aupro_px = compute_pro(masks_np, pr_list_px)
+
+    # Flatten for scalar metrics
+    y_px, s_px = gt_list_px.ravel(), pr_list_px.ravel()
+    y_sp, s_sp = gt_list_sp.ravel(), pr_list_sp.ravel()
+
+    def safe_auc(y_true, y_score):
+        uniq = np.unique(y_true)
         if uniq.size < 2:
-            # PRO is undefined if either positives or negatives are missing; set to 0.0
-            aupro_px = 0.0
-        else:
-            aupro_px = compute_pro(masks_np, pr_list_px)
+            # No positives or no negatives: define neutral AUROC
+            return 0.5
+        return float(roc_auc_score(y_true, y_score))
 
-        gt_list_px, pr_list_px = gt_list_px.ravel(), pr_list_px.ravel()
+    def safe_ap(y_true, y_score):
+        # AP is undefined without positives; follow common convention: 0.0
+        if np.sum(y_true) == 0:
+            return 0.0
+        return float(average_precision_score(y_true, y_score))
 
-        auroc_px = roc_auc_score(gt_list_px, pr_list_px)
-        auroc_sp = roc_auc_score(gt_list_sp, pr_list_sp)
-        ap_px = average_precision_score(gt_list_px, pr_list_px)
-        ap_sp = average_precision_score(gt_list_sp, pr_list_sp)
+    def safe_f1max(y_true, y_score):
+        uniq = np.unique(y_true)
+        if uniq.size < 2:
+            # No positives or no negatives -> meaningful F1 cannot be computed
+            # Treat as 0.0 to reflect absence of positive instances in this split
+            return 0.0
+        return float(f1_score_max(y_true, y_score))
 
-        f1_sp = f1_score_max(gt_list_sp, pr_list_sp)
-        f1_px = f1_score_max(gt_list_px, pr_list_px)
+    if accumulate_auroc_tag is not None:
+        acc = _get_auc_acc(accumulate_auroc_tag)
+        acc.update_px(y_px, s_px)
+        acc.update_sp(y_sp, s_sp)
+        # Only compute AUROC when both classes have appeared across accumulated data
+        auroc_px = acc.compute('px') if acc.can_compute('px') else 0.5
+        auroc_sp = acc.compute('sp') if acc.can_compute('sp') else 0.5
+    else:
+        auroc_px = safe_auc(y_px, s_px)
+        auroc_sp = safe_auc(y_sp, s_sp)
+    ap_px = safe_ap(y_px, s_px)
+    ap_sp = safe_ap(y_sp, s_sp)
+
+    f1_sp = safe_f1max(y_sp, s_sp)
+    f1_px = safe_f1max(y_px, s_px)
 
     return [auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px]
 

@@ -59,7 +59,6 @@ def concat_panel(image, sims):
     return torch.cat(imgs, dim=2)  # 横向拼接
 
 
-<<<<<<< HEAD
 def scores_heatmap_image(image, sim_map, cmap_name: str = 'coolwarm') -> torch.Tensor:
     """仅显示分数热图（不叠加原图）。返回张量 CHW、范围[0,1]。
 
@@ -87,8 +86,6 @@ def scores_heatmap_image(image, sim_map, cmap_name: str = 'coolwarm') -> torch.T
     return torch.from_numpy(heat).permute(2, 0, 1)
 
 
-=======
->>>>>>> 95543f4ba2cde27ac98c669cec890da83a8ccb07
 def _strip_module_prefix(state_dict: dict) -> dict:
     """移除由于DataParallel/DDP导致的 'module.' 前缀。"""
     if not isinstance(state_dict, dict) or not state_dict:
@@ -197,7 +194,6 @@ def visualize_ad2(model, dataset, device='cuda:0', save_dir='./vis_results', max
         final_sim = torch.mean(torch.stack(sims, dim=0), dim=0)
         sims.append(final_sim)
 
-<<<<<<< HEAD
     # 拼接成整张图（原图+各层叠加+最终平均叠加）
     panel = concat_panel(img[0].cpu(), sims)
     save_path = os.path.join(cls_dir, f"{img_name}.png")
@@ -209,12 +205,6 @@ def visualize_ad2(model, dataset, device='cuda:0', save_dir='./vis_results', max
     score_save = os.path.join(cls_dir, f"{img_name}_scores.png")
     # save_image expects [0,1]
     save_image(score_rgb, score_save)
-=======
-        # 拼接成整张图
-        panel = concat_panel(img[0].cpu(), sims)
-        save_path = os.path.join(cls_dir, f"{img_name}.png")
-        save_image(panel, save_path)
->>>>>>> 95543f4ba2cde27ac98c669cec890da83a8ccb07
 
     print(f"[DONE] 所有结果已保存至 {save_dir}")
 

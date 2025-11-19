@@ -700,12 +700,12 @@ class MVTecAD2Dataset(torch.utils.data.Dataset):
         imagesize=224,
         split=DatasetSplit.TRAIN,
         train_val_split=1.0,
-    preserve_aspect_ratio=False,
-    pad_to_square=False,
-    pad_mode='reflect',
-    pad_value=0.0,
-    resize_strategy='short_side',  # short_side | longest | none
-    center_crop=True,
+        preserve_aspect_ratio=False,
+        pad_to_square=False,
+        pad_mode='reflect',
+        pad_value=0.0,
+        resize_strategy='short_side',  # short_side | longest | none
+        center_crop=True,
         rotate_degrees=0,
         translate=0,
         brightness_factor=0,
@@ -813,7 +813,7 @@ class MVTecAD2Dataset(torch.utils.data.Dataset):
             possible_split_dirs = ['validation', 'val']
         elif split_name == 'test':
             # 测试优先匹配公开测试集，再退回精简名
-            possible_split_dirs = ['test_public', 'test', 'test_private', 'test_private_mixed']
+            possible_split_dirs = ['test_public']
         else:
             possible_split_dirs = [split_name]
 
@@ -844,8 +844,8 @@ class MVTecAD2Dataset(torch.utils.data.Dataset):
                         os.path.join(anomaly_path, x) for x in anomaly_files if os.path.isfile(os.path.join(anomaly_path, x))
                     ]
                     # mask仅test_public/bad有
-                    if split_name == "test_public" and anomaly == "bad":
-                        mask_dir = os.path.join(self.source, classname, "ground_truth", "bad")
+                    if split_name == "test" and anomaly == "bad":
+                        mask_dir = os.path.join(chosen_dir, "ground_truth", "bad")
                         mask_files = sorted(os.listdir(mask_dir)) if os.path.isdir(mask_dir) else []
                         maskpaths_per_class[classname][anomaly] = [
                             os.path.join(mask_dir, x) for x in mask_files

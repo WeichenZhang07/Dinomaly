@@ -81,6 +81,23 @@ def extract_layer_tokens_vit(encoder, x: torch.Tensor, target_layers: List[int])
     return feats
 
 
+def extract_layer_tokens_convnext(encoder, x: torch.Tensor, target_layers: List[int]) -> List[torch.Tensor]:
+    """For ConvNeXt (dinov3_convnext_base) using timm features_only interface.
+
+    Assumes the encoder was created with features_only=True and provides a list of
+    stage outputs. We index into that list using target_layers.
+    """
+    with torch.no_grad():
+        feats_all = encoder(x)  # List[Tensor], each (B,C,H,W)
+    # Guard if target indices exceed available features
+    max_idx = len(feats_all) - 1
+    sel = [i for i in target_layers if 0 <= i <= max_idx]
+    missing = sorted(set(target_layers) - set(sel))
+    if missing:
+        print(f"[WARN] ConvNeXt: skipping non-existent layer indices: {missing} (total features={len(feats_all)})")
+    return [feats_all[i] for i in sel]
+
+
 def _donut_flat_blocks(encoder) -> List[torch.nn.Module]:
     """Flatten Donut encoder blocks to a simple list (supports Swin/ViT backbones)."""
     enc = encoder.encoder if hasattr(encoder, "encoder") else encoder
@@ -268,7 +285,7 @@ def main():
     parser.add_argument('--ref', type=str, required=True)
     parser.add_argument('--errors', type=str, required=True)
     parser.add_argument('--output_dir', type=str, default='./similarity_outputs')
-    parser.add_argument('--encoder_type', type=str, default='dinov2', choices=['dinov2', 'donut'])
+    parser.add_argument('--encoder_type', type=str, default='dinov2', choices=['dinov2', 'donut', 'dinov3_convnext_base'])
     parser.add_argument('--encoder_name', type=str, default='dinov2reg_vit_base_14')
     parser.add_argument('--layers', type=str, default='all')
     parser.add_argument('--device', type=str, default=None)
@@ -295,12 +312,24 @@ def main():
         patch_h, patch_w = (14, 14)  # approximate ViT patch size
         num_register_tokens = 0
         extract_fn = extract_layer_tokens_donut
+    elif args.encoder_type == 'dinov3_convnext_base':
+        import timm
+        # Use features_only to get intermediate feature maps
+        encoder = timm.create_model('convnext_base', pretrained=True, features_only=True).eval().to(device)
+        # Determine patch size approximation by final downsampling (convnext_base total stride 32)
+        patch_h, patch_w = (32, 32)
+        num_register_tokens = 0
+        extract_fn = extract_layer_tokens_convnext
 
     # ========= Parse Layers ==========
     if args.encoder_type == 'dinov2':
         total_layers = len(encoder.blocks) if hasattr(encoder, "blocks") else 12
-    else:
+    elif args.encoder_type == 'donut':
         total_layers = len(_donut_flat_blocks(encoder))
+    elif args.encoder_type == 'dinov3_convnext_base':
+        # features_only convnext returns a list of 5 feature maps by default (stages outputs)
+        # We expose them as layers 0..len-1
+        total_layers = len(encoder.feature_info.channels()) if hasattr(encoder, 'feature_info') else 5
     if args.layers.strip().lower() == 'all':
         target_layers = list(range(total_layers))
     else:
