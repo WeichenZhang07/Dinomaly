@@ -688,10 +688,16 @@ class DatasetSplit(Enum):
     VAL = "val"
     TEST = "test"
 
+import os
+import PIL.Image
+import torch
+from torchvision import transforms
+
+# your existing constants
+MVTEC_AD2_CLASSNAMES = list(MVTEC_AD2_CLASSNAMES_LIST.keys())
+
 class MVTecAD2Dataset(torch.utils.data.Dataset):
-    """
-    PyTorch Dataset for MVTec AD 2.0 (mvtec_ad_2).
-    """
+
     def __init__(
         self,
         source,
@@ -704,172 +710,227 @@ class MVTecAD2Dataset(torch.utils.data.Dataset):
         pad_to_square=False,
         pad_mode='reflect',
         pad_value=0.0,
-        resize_strategy='short_side',  # short_side | longest | none
+        resize_strategy='short_side',
         center_crop=True,
-        rotate_degrees=0,
-        translate=0,
-        brightness_factor=0,
-        contrast_factor=0,
-        saturation_factor=0,
-        gray_p=0,
-        h_flip_p=0,
-        v_flip_p=0,
-        scale=0,
+        tile_size=None,        # ---- NEW -----
+        tile_stride=None,      # ---- NEW -----
+        global_size=224,       # ---- NEW -----
         **kwargs,
     ):
         super().__init__()
+
         self.source = source
         self.split = split
         self.classnames_to_use = [classname] if classname is not None else MVTEC_AD2_CLASSNAMES
         self.train_val_split = train_val_split
         self.preserve_aspect_ratio = preserve_aspect_ratio
-        self.transform_std = IMAGENET_STD
+
         self.transform_mean = IMAGENET_MEAN
+        self.transform_std = IMAGENET_STD
+
+        # TILE mode parameters
+        self.tile_size = tile_size
+        self.tile_stride = tile_stride or tile_size
+        self.global_size = global_size
+        self.tile_index = None
+        self.global_cache = {}
+
+        # load paths
         self.imgpaths_per_class, self.data_to_iterate = self.get_image_data()
 
-        # 根据参数构建图像/掩码的 resize + pad 流程
+        # ------------------------ Transforms ------------------------
         img_tfms = []
         mask_tfms = []
 
         if resize_strategy == 'longest':
-            # 按长边缩放到 imagesize，然后可选 Pad 到正方形
             img_tfms.append(LongestSideResize(imagesize))
             mask_tfms.append(LongestSideResize(imagesize, interpolation=PIL.Image.NEAREST))
             if pad_to_square:
                 img_tfms.append(PadToSquare(imagesize, mode=pad_mode, value=pad_value))
-                # 掩码恒定用0填充，避免引入非零无标注区域
-                mask_tfms.append(PadToSquare(imagesize, mode=pad_mode, value=0.0 if pad_mode == 'constant' else pad_value))
+                mask_tfms.append(PadToSquare(imagesize, mode=pad_mode, value=0))
         elif resize_strategy == 'short_side':
             if preserve_aspect_ratio:
-                # 保持短边到 imagesize，可选中心裁剪为正方形
                 img_tfms.append(AspectRatioResize(imagesize))
                 mask_tfms.append(AspectRatioResize(imagesize, interpolation=PIL.Image.NEAREST))
                 if center_crop:
                     img_tfms.append(transforms.CenterCrop(imagesize))
                     mask_tfms.append(transforms.CenterCrop(imagesize))
             else:
-                # 直接拉伸至目标分辨率
                 img_tfms.append(transforms.Resize((imagesize, imagesize)))
-                mask_tfms.append(transforms.Resize((imagesize, imagesize), interpolation=transforms.InterpolationMode.NEAREST))
-        elif resize_strategy == 'none':
-            # 不做尺寸变换，仅在需要时 Pad
-            if pad_to_square:
-                img_tfms.append(PadToSquare(imagesize, mode=pad_mode, value=pad_value))
-                mask_tfms.append(PadToSquare(imagesize, mode=pad_mode, value=0.0 if pad_mode == 'constant' else pad_value))
+                mask_tfms.append(transforms.Resize((imagesize, imagesize), interpolation=PIL.Image.NEAREST))
+        elif resize_strategy == 'none' and pad_to_square:
+            img_tfms.append(PadToSquare(imagesize, mode=pad_mode, value=pad_value))
+            mask_tfms.append(PadToSquare(imagesize, mode=pad_mode, value=0))
 
-        # 转张量与归一化
         img_tfms.extend([
             transforms.ToTensor(),
-            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+            transforms.Normalize(mean=self.transform_mean, std=self.transform_std)
         ])
-        mask_tfms.extend([
-            transforms.ToTensor(),
-        ])
+        mask_tfms.append(transforms.ToTensor())
 
         self.transform_img = transforms.Compose(img_tfms)
         self.transform_mask = transforms.Compose(mask_tfms)
 
-        self.imagesize = (3, imagesize, imagesize)
-
-    
-    
-    def __getitem__(self, idx):
-        classname, anomaly, image_path, mask_path = self.data_to_iterate[idx]
-        image = PIL.Image.open(image_path).convert("RGB")
-        image = self.transform_img(image)
-
-        if self.split == DatasetSplit.TEST and mask_path is not None:
-            mask = PIL.Image.open(mask_path)
-            mask = self.transform_mask(mask)
-        else:
-            mask = torch.zeros([1, *image.size()[1:]])
-        classid = classname_to_idTensor(classname)
-
-        return {
-            "image": image,
-            "mask": mask,
-            "classname": classname,
-            "classid": classid,
-            "anomaly": anomaly,
-            "is_anomaly": int(anomaly != "good"),
-            "image_name": "/".join(image_path.replace("\\", "/").split("/")[-4:]),
-            "image_path": image_path,
-        }
-
-    def __len__(self):
-        return len(self.data_to_iterate)
+        if self.tile_size is not None:
+            self._build_tile_index()
 
 
+    # ------------------------------------------------------------------
     def get_image_data(self):
         imgpaths_per_class = {}
         maskpaths_per_class = {}
-        # 原枚举中仅有 train/val/test，这里做目录别名映射，支持实际数据中的 validation / test_public 等
-        split_name = self.split.value  # 'train' | 'val' | 'test'
-        possible_split_dirs = []
+
+        split_name = self.split.value
+
         if split_name == 'train':
-            possible_split_dirs = ['train']
+            possible_dirs = ['train']
         elif split_name == 'val':
-            # 优先使用 'validation' 若存在，否则退回 'val'
-            possible_split_dirs = ['validation', 'val']
+            possible_dirs = ['validation', 'val']
         elif split_name == 'test':
-            # 测试优先匹配公开测试集，再退回精简名
-            possible_split_dirs = ['test_public']
+            possible_dirs = ['test_public']
         else:
-            possible_split_dirs = [split_name]
+            possible_dirs = [split_name]
 
         for classname in self.classnames_to_use:
             if not isinstance(classname, str):
-                # Skip invalid classname entries (e.g., dict accidentally passed)
                 continue
-            # 选择第一个存在的 split 目录
-            chosen_dir = None
-            for cand in possible_split_dirs:
+
+            selected_dir = None
+            for cand in possible_dirs:
                 cand_dir = os.path.join(self.source, classname, cand)
                 if os.path.isdir(cand_dir):
-                    chosen_dir = cand_dir
+                    selected_dir = cand_dir
                     break
-            if chosen_dir is None:
-                # 若所有候选都不存在，保留第一候选做报错参考
-                chosen_dir = os.path.join(self.source, classname, possible_split_dirs[0])
-            class_dir = chosen_dir
+            if selected_dir is None:
+                selected_dir = os.path.join(self.source, classname, possible_dirs[0])
+
             imgpaths_per_class[classname] = {}
             maskpaths_per_class[classname] = {}
 
-            # 所有split都支持good/bad子目录
             for anomaly in ["good", "bad"]:
-                anomaly_path = os.path.join(class_dir, anomaly)
-                if os.path.isdir(anomaly_path):
-                    anomaly_files = sorted(os.listdir(anomaly_path))
+                anomaly_dir = os.path.join(selected_dir, anomaly)
+                if os.path.isdir(anomaly_dir):
+                    files = sorted(os.listdir(anomaly_dir))
                     imgpaths_per_class[classname][anomaly] = [
-                        os.path.join(anomaly_path, x) for x in anomaly_files if os.path.isfile(os.path.join(anomaly_path, x))
+                        os.path.join(anomaly_dir, f) for f in files if os.path.isfile(os.path.join(anomaly_dir, f))
                     ]
-                    # mask仅test_public/bad有
                     if split_name == "test" and anomaly == "bad":
-                        mask_dir = os.path.join(chosen_dir, "ground_truth", "bad")
-                        mask_files = sorted(os.listdir(mask_dir)) if os.path.isdir(mask_dir) else []
+                        mask_dir = os.path.join(selected_dir, "ground_truth", "bad")
+                        masks = sorted(os.listdir(mask_dir)) if os.path.isdir(mask_dir) else []
                         maskpaths_per_class[classname][anomaly] = [
-                            os.path.join(mask_dir, x) for x in mask_files
+                            os.path.join(mask_dir, m) for m in masks
                         ]
                     else:
                         maskpaths_per_class[classname][anomaly] = [None] * len(imgpaths_per_class[classname][anomaly])
-            # 如果没有good/bad子目录，直接检索class_dir下图片
-            if not imgpaths_per_class[classname]:
-                if os.path.isdir(class_dir):
-                    anomaly_files = sorted(os.listdir(class_dir))
-                    imgpaths_per_class[classname]["good"] = [
-                        os.path.join(class_dir, x) for x in anomaly_files if os.path.isfile(os.path.join(class_dir, x))
-                    ]
-                    maskpaths_per_class[classname]["good"] = [None] * len(imgpaths_per_class[classname]["good"])
 
-        # Unrolls the data dictionary to an easy-to-iterate list.
-        data_to_iterate = []
+        data_list = []
         for classname in sorted(imgpaths_per_class.keys()):
             for anomaly in sorted(imgpaths_per_class[classname].keys()):
-                for i, image_path in enumerate(imgpaths_per_class[classname][anomaly]):
-                    data_tuple = [classname, anomaly, image_path]
-                    mask_list = maskpaths_per_class[classname][anomaly]
-                    mask_path = mask_list[i] if mask_list and i < len(mask_list) else None
-                    data_tuple.append(mask_path)
-                    data_to_iterate.append(data_tuple)
+                for i, imgp in enumerate(imgpaths_per_class[classname][anomaly]):
+                    maskp = maskpaths_per_class[classname][anomaly][i]
+                    data_list.append([classname, anomaly, imgp, maskp])
 
-        return imgpaths_per_class, data_to_iterate
+        return imgpaths_per_class, data_list
+
+
+    # ------------------------------------------------------------------
+    def _build_tile_index(self):
+        self.tile_index = []
+        for classname, anomaly, imgp, maskp in self.data_to_iterate:
+            img = PIL.Image.open(imgp).convert("RGB")
+            W, H = img.size
+
+            cols = max(1, (W - self.tile_size) // self.tile_stride + 1)
+            rows = max(1, (H - self.tile_size) // self.tile_stride + 1)
+
+            for r in range(rows):
+                for c in range(cols):
+                    x0 = c * self.tile_stride
+                    y0 = r * self.tile_stride
+                    x1 = x0 + self.tile_size
+                    y1 = y0 + self.tile_size
+
+                    self.tile_index.append({
+                        "classname": classname,
+                        "anomaly": anomaly,
+                        "image_path": imgp,
+                        "mask_path": maskp,
+                        "raw_size": (H, W),
+                        "tile_box": (x0, y0, x1, y1),
+                    })
+
+
+    # ------------------------------------------------------------------
+    def _getitem_tile(self, idx):
+        info = self.tile_index[idx]
+
+        img = PIL.Image.open(info["image_path"]).convert("RGB")
+        W, H = info["raw_size"]
+        x0, y0, x1, y1 = info["tile_box"]
+
+        # Tile crop + resize
+        tile = img.crop((x0, y0, x1, y1))
+        tile = tile.resize((self.tile_size, self.tile_size), PIL.Image.BILINEAR)
+        tile = transforms.ToTensor()(tile)
+        tile = transforms.Normalize(self.transform_mean, self.transform_std)(tile)
+
+        # Mask tile
+        if self.split == DatasetSplit.TEST and info["mask_path"] is not None:
+            mask_full = PIL.Image.open(info["mask_path"])
+            mask = transforms.ToTensor()(mask_full.crop((x0, y0, x1, y1)))
+        else:
+            mask = torch.zeros([1, self.tile_size, self.tile_size])
+
+        # Cached global image
+        if info["image_path"] not in self.global_cache:
+            g = PIL.Image.open(info["image_path"]).convert("RGB")
+            g = g.resize((self.global_size, self.global_size), PIL.Image.BILINEAR)
+            g = transforms.ToTensor()(g)
+            g = transforms.Normalize(self.transform_mean, self.transform_std)(g)
+            self.global_cache[info["image_path"]] = g
+
+        tile_coord = torch.tensor([x0/W, y0/H, x1/W, y1/H], dtype=torch.float32)
+
+        return {
+            "image": tile,
+            "mask": mask,
+            "classname": info["classname"],
+            "classid": classname_to_idTensor(info["classname"]),
+            "anomaly": info["anomaly"],
+            "is_anomaly": int(info["anomaly"] != "good"),
+            "image_path": info["image_path"],
+            "tile_coord": tile_coord,
+            "global_image": self.global_cache[info["image_path"]],
+        }
+
+
+    # ------------------------------------------------------------------
+    def _getitem_normal(self, idx):
+        classname, anomaly, imgp, maskp = self.data_to_iterate[idx]
+        img = PIL.Image.open(imgp).convert("RGB")
+        img = self.transform_img(img)
+
+        if self.split == DatasetSplit.TEST and maskp is not None:
+            mask = PIL.Image.open(maskp)
+            mask = self.transform_mask(mask)
+        else:
+            mask = torch.zeros([1, *img.size()[1:]])
+
+        return {
+            "image": img,
+            "mask": mask,
+            "classname": classname,
+            "classid": classname_to_idTensor(classname),
+            "anomaly": anomaly,
+            "is_anomaly": int(anomaly != "good"),
+            "image_name": "/".join(imgp.replace("\\", "/").split("/")[-4:]),
+            "image_path": imgp,
+        }
+
+
+    # ------------------------------------------------------------------
+    def __getitem__(self, idx):
+        return self._getitem_tile(idx) if self.tile_size else self._getitem_normal(idx)
+
+    def __len__(self):
+        return len(self.tile_index) if self.tile_size else len(self.data_to_iterate)

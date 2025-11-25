@@ -832,3 +832,225 @@ class ViTillDual(nn.Module):
 
         return en_fused, de_fused
 
+import math
+from typing import Dict, List, Tuple, Optional, Callable
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class ViTMultiModal(nn.Module):
+    """
+    多模态 / 多编码器版本：
+    - 支持多个异构 encoder（resnet, dino, sam_encoder, donut 等）
+    - 每个 encoder 指定若干层做特征提取 -> 统一空间尺度 -> 投影到相同 embed_dim
+    - 每个 encoder 有独立 bottleneck（若干 bMlp 堆叠）
+    - 之后用可学习的 gating 将多 encoder 表征融合
+    - 融合后的 tokens / feature map 送入 ViT/DiNOv2 同构 decoder
+
+    约定：
+    - encoder_extractors[name](x) -> List[Tensor]，每个 Tensor 支持：
+        B×C×H×W 或 B×N×C（会自动转成 B×C×H×W 再 resize）
+    - encoder_target_layers[name] = [idx0, idx1, ...] 指定取哪些层
+    - encoder_out_dims[name] = C_in（投影前通道数），方便提前构建 Linear（避免lazy-param）
+    - decoder(x)：默认接收 B×C×H×W，返回 decoder 中间层列表或最终输出（你现有 decoder 自定义）
+    """
+
+    def __init__(
+        self,
+        encoders: Dict[str, nn.Module],
+        encoder_extractors: Dict[str, Callable],
+        decoder: nn.Module,
+        encoder_target_layers: Dict[str, List[int]],
+        encoder_out_dims: Dict[str, int],   # 每个 encoder 融合后特征的通道数 C_in
+        target_hw: Tuple[int, int],         # 统一对齐到的空间尺寸 (H_t, W_t)
+        embed_dim: int = 768,
+        bottleneck_depth: int = 2,
+        bottleneck_dropout: float = 0.3,
+        fusion_dropout: float = 0.1,
+    ):
+        super().__init__()
+
+        # ----- 保存模块 / 配置 -----
+        self.encoders = nn.ModuleDict(encoders)
+        self.encoder_extractors = encoder_extractors
+        self.decoder = decoder
+
+        self.encoder_target_layers = encoder_target_layers
+        self.encoder_out_dims = encoder_out_dims
+        self.target_hw = target_hw
+        self.embed_dim = embed_dim
+        self.bottleneck_depth = bottleneck_depth
+        self.bottleneck_dropout = bottleneck_dropout
+
+        # ----- 每个 encoder 各自的投影 + bottleneck -----
+        proj_layers = {}
+        bottlenecks = {}
+        for name, c_in in encoder_out_dims.items():
+            # C_in -> embed_dim
+            proj_layers[name] = nn.Linear(c_in, embed_dim)
+
+            blocks = []
+            for _ in range(bottleneck_depth):
+                # 这里用你之前的 bMlp（dim, inner_dim, dim）
+                blocks.append(bMlp(embed_dim, embed_dim * 4, embed_dim, drop=bottleneck_dropout))
+            bottlenecks[name] = nn.Sequential(*blocks)
+
+        self.proj_layers = nn.ModuleDict(proj_layers)
+        self.bottlenecks = nn.ModuleDict(bottlenecks)
+
+        # ----- Dropout -----
+        self.encoder_dropout = nn.Dropout(fusion_dropout)
+
+        # ----- 可学习的模态融合 gating -----
+        # 一个非常简单但有效的方案：为每个 encoder 学一个标量 gate，Softmax 后作为加权系数。
+        self.encoder_names = list(encoders.keys())
+        self.fusion_logit = nn.Parameter(torch.zeros(len(self.encoder_names)))  # [M]
+
+    # ----------------- 一些工具函数 -----------------
+
+    def _feat_to_spatial(self, feat: torch.Tensor) -> torch.Tensor:
+        """
+        支持两种输入：
+        - B×C×H×W: 原样返回
+        - B×N×C: 视为 ViT tokens，恢复成 B×C×H×W（要求 N 为平方数）
+        """
+        if feat.dim() == 4:
+            return feat
+        elif feat.dim() == 3:
+            B, N, C = feat.shape
+            side = int(math.sqrt(N))
+            assert side * side == N, f"N={N} 不是完全平方，无法自动还原为 H×W"
+            feat = feat.transpose(1, 2).contiguous().view(B, C, side, side)
+            return feat
+        else:
+            raise ValueError(f"feat.dim() must be 3 or 4, got {feat.dim()}")
+
+    def _spatial_to_tokens(self, feat: torch.Tensor) -> torch.Tensor:
+        """
+        B×C×H×W -> B×(H*W)×C
+        """
+        B, C, H, W = feat.shape
+        tok = feat.flatten(2).transpose(1, 2).contiguous()
+        return tok  # B×N×C
+
+    def _resize_to_target(self, feat: torch.Tensor) -> torch.Tensor:
+        """
+        将 B×C×H×W resize 到 target_hw（H_t, W_t）
+        """
+        B, C, H, W = feat.shape
+        H_t, W_t = self.target_hw
+        if H == H_t and W == W_t:
+            return feat
+        return F.interpolate(feat, size=(H_t, W_t), mode="bilinear", align_corners=False)
+
+    def _encode_and_bottleneck_single(
+        self,
+        name: str,
+        x: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        对单个 encoder：
+        1) extractor 得到多层特征
+        2) 取 encoder_target_layers[name] 指定的层
+        3) 各层转 B×C×H×W，再 resize 到 target_hw
+        4) 多层做平均融合 -> 得到该 encoder 的统一尺度特征 B×C_in×H_t×W_t
+        5) flatten 成 tokens -> Dropout -> Linear 投影到 embed_dim
+        6) 经过 encoder 自己的 bottleneck
+        返回：
+            tokens_after_bottleneck: B×N×D
+            spatial_after_bottleneck: B×D×H_t×W_t
+        """
+        extractor = self.encoder_extractors[name]
+        feats = extractor(x)  # List[Tensor]
+
+        # 选中若干层
+        layer_ids = self.encoder_target_layers[name]
+        selected_spatial = []
+        for lid in layer_ids:
+            f = feats[lid]    # 可能是 B×C×H×W 或 B×N×C
+            f_sp = self._feat_to_spatial(f)
+            f_sp = self._resize_to_target(f_sp)
+            selected_spatial.append(f_sp)
+
+        # 多层做简单平均（你后面可以换成更复杂的跨层融合）
+        if len(selected_spatial) == 1:
+            fused_sp = selected_spatial[0]
+        else:
+            fused_sp = torch.stack(selected_spatial, dim=0).mean(0)  # [B,C,H_t,W_t]
+
+        # -> tokens
+        tok = self._spatial_to_tokens(fused_sp)   # [B,N,C_in]
+
+        # Dropout
+        tok = self.encoder_dropout(tok)
+
+        # 投影到 embed_dim
+        proj = self.proj_layers[name]            # Linear(C_in -> D)
+        tok = proj(tok)                          # [B,N,D]
+
+        # Bottleneck（多层 bMlp 堆叠）
+        tok_bn = self.bottlenecks[name](tok)     # [B,N,D]
+
+        # to spatial
+        sp_bn = tok_bn.transpose(1, 2)           # [B,D,N]
+        H_t, W_t = self.target_hw
+        sp_bn = sp_bn.view(sp_bn.size(0), self.embed_dim, H_t, W_t)
+
+        return tok_bn, sp_bn
+
+    # ----------------- forward -----------------
+
+    def forward(self, x: torch.Tensor):
+        """
+        输入：
+            x: 通常是统一预处理后的全图 / tile 图像，B×3×H×W
+        输出（推荐结构）：
+            {
+                "encoder_tokens": Dict[name -> B×N×D],
+                "encoder_spatial": Dict[name -> B×D×H_t×W_t],
+                "fused_tokens": B×N×D,
+                "fused_spatial": B×D×H_t×W_t,
+                "decoder_layers": decoder_outputs
+            }
+        """
+
+        encoder_tokens = {}
+        encoder_spatial = {}
+
+        # 1) 对每个 encoder 单独处理 -> tokens_after_bottleneck
+        for name in self.encoder_names:
+            tok_bn, sp_bn = self._encode_and_bottleneck_single(name, x)
+            encoder_tokens[name] = tok_bn
+            encoder_spatial[name] = sp_bn
+
+        # 2) 可学习的模态融合（global gating）
+        #   shape: enc_list -> [M,B,N,D]
+        tokens_list = [encoder_tokens[name] for name in self.encoder_names]
+        stack_tok = torch.stack(tokens_list, dim=0)  # [M,B,N,D]
+
+        # gating 权重：对 encoder 维度做 softmax
+        weights = F.softmax(self.fusion_logit, dim=0)  # [M]
+        w = weights.view(-1, 1, 1, 1)                  # [M,1,1,1]
+
+        fused_tokens = (w * stack_tok).sum(0)          # [B,N,D]
+
+        # 3) tokens -> spatial（送给 decoder）
+        B, N, D = fused_tokens.shape
+        H_t, W_t = self.target_hw
+        assert N == H_t * W_t, f"融合后 tokens 数量 N={N} 与 H_t*W_t={H_t*W_t} 不一致"
+
+        fused_spatial = fused_tokens.transpose(1, 2).view(B, D, H_t, W_t)  # [B,D,H_t,W_t]
+
+        # 4) Decoder 前向（ViT / DINOv2 同构 decoder）
+        #    假设 decoder(x) 返回一个 list（自上到下或反向蒸馏顺序）
+        decoder_out = self.decoder(fused_spatial)
+
+        return {
+            "encoder_tokens": encoder_tokens,
+            "encoder_spatial": encoder_spatial,
+            "fused_tokens": fused_tokens,
+            "fused_spatial": fused_spatial,
+            "decoder_layers": decoder_out,
+        }
