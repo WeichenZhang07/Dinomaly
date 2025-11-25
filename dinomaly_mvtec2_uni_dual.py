@@ -167,25 +167,18 @@ def train_dual(args):
 
     device = args.device
 
-    # encoders: Donut (encoder) + ConvNeXt Base
-    encoder_b = None
-    if mode == 'dual':
-        from transformers import DonutProcessor, VisionEncoderDecoderModel
-        processor = DonutProcessor.from_pretrained("naver-clova-ix/donut-base",local_files_only=True)  # not used directly but cached
-        donut_model = VisionEncoderDecoderModel.from_pretrained("naver-clova-ix/donut-base",local_files_only=True)
-        encoder_b = donut_model.encoder.eval().to(device)  # Swin-like
-
-    # Prefer HuggingFace Dinov3 ConvNeXt encoder when available; fallback to timm ConvNeXt otherwise
-    from transformers import AutoModel
-    import os, glob
+    # ============================================
+    # encoders: ConvNeXt (DINO) + Donut encoder
+    # ============================================
+    from transformers import AutoModel  # >>> MODIFIED <<<
+    import glob  # >>> MODIFIED <<<
 
     # -------------------------
     # 强制 OFFLINE 模式，防止联网
     # -------------------------
     os.environ["HF_HUB_OFFLINE"] = "1"
-    for k in ["HTTP_PROXY","HTTPS_PROXY","http_proxy","https_proxy"]:
+    for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]:
         os.environ.pop(k, None)
-
 
     # -------------------------
     # 本地 snapshot 查找方法
@@ -200,9 +193,7 @@ def train_dual(args):
         snaps = glob.glob(os.path.join(base, "snapshots", "*"))
         return snaps[0] if snaps else None
 
-
     hf_repo = "facebook/dinov3-convnext-base-pretrain-lvd1689m"
-
     local_path = _find_local_snapshot(hf_repo)
 
     if local_path:
@@ -210,13 +201,9 @@ def train_dual(args):
         hf_model = AutoModel.from_pretrained(local_path, local_files_only=True)
     else:
         print(f"⚠ No local cache found for {hf_repo}, falling back to timm.")
-        import timm
         hf_model = timm.create_model("convnext_base.fb_in22k_ft_in1k", pretrained=True)
 
-
-    # -------------------------
-    # 和你原来一致：自动提取 backbone
-    # -------------------------
+    # 自动提取 ConvNeXt / DINO backbone
     encoder_candidate = None
     for attr in ("vision_model", "dinov3", "base_model", "encoder", "backbone", "model"):
         if hasattr(hf_model, attr):
@@ -224,41 +211,107 @@ def train_dual(args):
             print(f"✔ Found backbone at attribute: {attr}")
             break
 
-    encoder_a = (encoder_candidate or hf_model).eval().to(device)
+    dino_encoder = (encoder_candidate or hf_model).eval().to(device)  # ConvNeXt / DINO encoder
 
+    # Donut encoder
+    from transformers import DonutProcessor, VisionEncoderDecoderModel
+    processor = DonutProcessor.from_pretrained("naver-clova-ix/donut-base", local_files_only=True)
+    donut_model = VisionEncoderDecoderModel.from_pretrained("naver-clova-ix/donut-base", local_files_only=True)
+    donut_encoder = donut_model.encoder.eval().to(device)
 
-    # Build extractors and infer groups dynamically to avoid hard-coded indices
-    extA = ConvNeXtExtractor(encoder_a).to(device)
-    extB = None
-    groups_b = None
-    if mode == 'dual':
+    # 预定义两路的 groups（与之前保持一致）
+    dino_groups = [[8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
+                   [22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35]]  # 原 groups_a
+    donut_groups = [[5, 6, 7, 8],
+                    [9, 10, 11, 12]]  # 原 groups_b
+
+    # ============================================
+    # MODE 映射：无论如何，ViTillDual 都通过 encoder_a + groups_a 入口吃特征
+    # dino  : ConvNeXt → A 流
+    # donut : Donut    → A 流
+    # dual  : ConvNeXt → A, Donut → B
+    # ============================================
+    if mode == 'dino':
+        print("Mode = DINO: ConvNeXt → encoder_a stream.")
+        encoder_a = dino_encoder
+        encoder_b = None
+
+        groups_a = dino_groups
+        groups_b = None
+
+    elif mode == 'donut':
+        print("Mode = DONUT: Donut → encoder_a stream.")
+        encoder_a = donut_encoder
+        encoder_b = None
+
+        groups_a = donut_groups
+        groups_b = None
+
+    else:  # dual
+        print("Mode = DUAL: ConvNeXt → encoder_a, Donut → encoder_b.")
+        encoder_a = dino_encoder
+        encoder_b = donut_encoder
+
+        groups_a = dino_groups
+        groups_b = donut_groups
+
+    # ============================================
+    # 根据 encoder_a / encoder_b 类型构建 extractor
+    # （A 流永远存在，B 流只有 dual 时存在）
+    # ============================================
+    extA, extB = None, None  # >>> MODIFIED <<<
+
+    if mode == 'dino':
+        # encoder_a 是 ConvNeXt / DINO
+        extA = ConvNeXtExtractor(encoder_a).to(device)
+        extB = None
+
+    elif mode == 'donut':
+        # encoder_a 是 Donut encoder（Swin-like）
+        extA = SwinExtractor(encoder_a).to(device)
+        extB = None
+
+    else:  # dual
+        # A: ConvNeXt, B: Donut
+        extA = ConvNeXtExtractor(encoder_a).to(device)
         extB = SwinExtractor(encoder_b).to(device)
-        with torch.inference_mode():
-            x_probe = torch.zeros(1, 3, imagesize, imagesize, device=device)
-            feats_b = extB(x_probe)
-        groups_b = [[5,6,7,8], [9,10,11,12]]#splited stage2
 
-    groups_a = [[8,9,10,11,12,13,14,15,16,17,18,19,20,21], [22,23,24,25,26,27,28,29,30,31,32,33,34,35]]#splited stage2
-
-
-    # decoder: DeConvNeXt (dual stream). ViTillDual will pass two branches separately.
-    decoder = de_convnext_dinov3_base(dual_stream=(mode=='dual'))
+    # ============================================
+    # decoder: DeConvNeXt (dual stream 开关完全沿用原逻辑)
+    # ============================================
+    decoder = de_convnext_dinov3_base(dual_stream=(mode == 'dual'))
 
     # groups for decoder: only stage3 as target, 2 groups both map to stage index 2
-    fuse_layer_decoder = [[5,6,7,8],[9,10,11,12]] #splited stage2
-    fuse_layer_encoder = [groups_a]
-    if mode == 'dual':
+    fuse_layer_decoder = [[5, 6, 7, 8], [9, 10, 11, 12]]  # splited stage2
+
+    # fuse_layer_encoder: 只塞入存在的那几路
+    fuse_layer_encoder = []
+    if groups_a is not None:
+        fuse_layer_encoder.append(groups_a)
+    if groups_b is not None:
         fuse_layer_encoder.append(groups_b)
 
+    # target_a / target_b：直接展平对应 groups（与原来的列表等价）
+    target_a = None
+    if groups_a is not None:
+        target_a = groups_a[0] + groups_a[1]
+
+    target_b = None
+    if groups_b is not None:
+        target_b = groups_b[0] + groups_b[1]
+
+    # ============================================
+    # 构建 ViTillDual（对外接口完全不变）
+    # ============================================
     model = ViTillDual(
         encoder_a=encoder_a,
         encoder_b=encoder_b,
         decoder=decoder,
         fuse_layer_encoder=fuse_layer_encoder,
         fuse_layer_decoder=fuse_layer_decoder,
-        encoder_extractors = (extA, extB),
-        target_a = [8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35],
-        target_b = [5,6,7,8,9,10,11,12] if mode=='dual' else None,
+        encoder_extractors=(extA, extB),
+        target_a=target_a,
+        target_b=target_b,
         mode=mode,
     ).to(device)
 
@@ -276,12 +329,13 @@ def train_dual(args):
         for blk in model.bottleneck_blocks:
             trainable_params += list(blk.parameters())
 
-    # 3) Dual 模式策略：默认不训练 encoder_b，也不再存在 proj/head 分支
+    # 3) Dual / dino / donut 模式下仅日志提示，不改训练范围
     if mode == 'dual':
-        print("⚠ Dual mode: encoder_b is frozen, no additional projection heads required.")
-    else:
-        print("✔ Single mode: only decoder + bottleneck participate in training.")
-
+        print("⚠ Dual mode: both encoders exist (frozen), decoder dual-stream.")
+    elif mode == 'dino':
+        print("✔ Dino mode: using only ConvNeXt (DINO) encoder (as A-stream).")
+    elif mode == 'donut':
+        print("✔ Donut mode: using only Donut encoder (as A-stream).")
 
     optimizer = StableAdamW([{'params': trainable_params}],
                             lr=args.lr, betas=(0.9, 0.999), weight_decay=1e-4, amsgrad=True, eps=1e-10)
@@ -295,7 +349,7 @@ def train_dual(args):
     print_fn(f"mode: {mode}")
     print_fn(f"train images: {len(train_data)} | classes: {','.join(class_list)}")
     print_fn(f"groups_a: {groups_a}")
-    if mode == 'dual':
+    if groups_b is not None:
         print_fn(f"groups_b: {groups_b}")
     #print_fn(f"decoder inplanes (fused C): {inplanes}")
 
@@ -311,11 +365,10 @@ def train_dual(args):
             img = batch["image"].to(device)
 
             outputs = model(img)
-            
+
             # New loss calculation based on model output
             en, de = model(img)   # new API output already (B,C,H,W)
             # nothing else needed — model already fused+reshaped
-
 
             # Use only 2-group outputs; ViTillDual returns lists per group
             # curriculum HM-percent cosine as in previous script
@@ -367,7 +420,7 @@ def train_dual(args):
             if (it + 1) % args.save_every == 0:
                 ckpt_path = os.path.join(ckpt_dir, f"model_iter_{it+1}.pth")
                 print_fn(f"Saving checkpoint: {ckpt_path}")
-                
+
                 # Construct state dict with all trainable parts
                 trainable_state_dict = {
                     'decoder': model.decoder.state_dict(),
@@ -410,7 +463,7 @@ def train_dual(args):
     # final checkpoint (decoder + bottleneck only)
     final_path = os.path.join(ckpt_dir, 'model_final.pth')
     print_fn(f"Saving final (small) model to {final_path}")
-    
+
     final_trainable_state_dict = {
         'decoder_state_dict': model.decoder.state_dict(),
         'proj_a_state_dict': model.proj_a.state_dict(),
@@ -429,11 +482,11 @@ def train_dual(args):
         'encoders_meta': {'a': type(model.encoder_a).__name__, 'b': type(model.encoder_b).__name__ if model.encoder_b else None},
         'mode': mode,
     }
-    
+
     for k, v in final_state.items():
         if isinstance(v, dict) and k.endswith('_state_dict'):
             final_state[k] = {key: val.cpu() for key, val in v.items()}
-            
+
     safe_torch_save(final_state, final_path, print_fn=print_fn)
 
 
@@ -452,7 +505,7 @@ def parse_args():
     parser.add_argument('--save_every', type=int, default=500, help='Save checkpoint every N iterations')
     parser.add_argument('--lr', type=float, default=2e-3)
     parser.add_argument('--lr_final', type=float, default=2e-4)
-    parser.add_argument('--mode', type=str, default='dual', choices=['dual', 'single'], help='Model mode: dual or single encoder')
+    parser.add_argument('--mode', type=str, default='dual', choices=['dino', 'donut', 'dual'])
     args = parser.parse_args()
     args.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     return args

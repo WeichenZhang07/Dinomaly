@@ -6,6 +6,8 @@ from torch.nn.modules.batchnorm import _BatchNorm
 from sklearn.cluster import KMeans
 import math
 
+from models.vision_transformer import bMlp
+
 
 class ViTill(nn.Module):
     def __init__(
@@ -716,21 +718,17 @@ class ViTillDual(nn.Module):
     def _init_bottleneck_if_needed(self, dim, device=None):
         if self.bottleneck_blocks is not None:
             return
-        
-        if device is None:
-            device = next(self.parameters()).device   # fallback
 
-        blocks = []
-        for _ in range(self.bottleneck_depth):
-            blocks.append(
-                nn.Sequential(
-                    nn.LayerNorm(dim),
-                    nn.Linear(dim, dim),
-                    nn.GELU(),
-                    nn.Dropout(self.bottleneck_dropout),
-                )
-            )
-        self.bottleneck_blocks = nn.ModuleList(blocks).to(device)
+        if device is None:
+            device = next(self.parameters()).device  # fallback
+
+        # ---- 🔄 替换为你的 MLP Block ----
+        blocks = nn.ModuleList([
+            bMlp(dim, dim * 4, dim, drop=self.bottleneck_dropout)
+        ])
+
+        self.bottleneck_blocks = blocks.to(device)
+
 
 
 
